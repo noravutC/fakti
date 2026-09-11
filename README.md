@@ -100,9 +100,10 @@ See the [official Codex CLI reference](https://developers.openai.com/codex/cli/r
 If your working tree is dirty, the dialog asks first: **stash** (`git stash push -u`) or
 **continue on the current branch** (no new branch is created).
 
-> The defect list is **mock data** from `server/src/mock/defects.json`. There is no ticket
-> tracker integration yet. Two entries come from the original design doc; the rest are made up.
-> That file is bundled at build time, so edit it then re-run `pnpm -C server build`.
+> Out of the box the defect list is **mock data** from `server/src/mock/defects.json`, served
+> back to fakti as an ordinary source so it needs no network. Two entries come from the original
+> design doc; the rest are made up. That file is bundled at build time, so edit it then re-run
+> `pnpm -C server build`. To use a real tracker instead, see **Connecting a tracker** below.
 
 ---
 
@@ -112,20 +113,24 @@ Every page has a real URL. Refresh keeps you where you were, and the browser bac
 everywhere.
 
 ```
-/                       defect list (home, no breadcrumb)
-/session/:id            Defect / <branch>
-/session/:id/summary    Defect / <branch> / สรุป
+/                       defect list (home)
+/feature/new            สั่งงานเอง — type requirements instead of picking defects
+/session/:id            the session's terminal
+/session/:id/summary    diff and commits for that session
 /sessions               session history
-/settings               workspaces, active repo
+/settings               repos, active source, appearance
 /setup                  add a repo
 ```
 
-- Every sub-page has a back link in the top-left naming its real destination.
+- A **sidebar** is on every page, so Session history and Settings are always one click away,
+  even with nothing running. It also carries the active repo and its live git status — that
+  information appears in exactly one place.
+- The sidebar's Session row keeps a count at all times, `0` included. It turns amber and pulses
+  the moment a session is waiting on you, so you can see it from any page.
+- Every sub-page also has a back link in the top-left naming its real destination.
 - **Esc** goes back — except on the session page, where the terminal needs it.
 - The session page says **"ย่อเก็บ"** (minimise), not "close". Leaving the page does **not** kill
   the session; the pty keeps running. Actually closing it lives in the `⋯` menu behind a confirm.
-- The header shows a pill (`⟳ 2 session`) whenever sessions are alive. It turns amber and pulses
-  if one is waiting on you.
 - Unknown URLs and deleted session ids redirect home with a message instead of a blank screen.
 
 ---
@@ -133,31 +138,128 @@ everywhere.
 ## Project layout
 
 ```
-shared/types.ts        API contract shared by both sides via the @shared/* path alias
-server/src/core/       config (~/.pat + zod), git, session (pty lifecycle), prompt
-server/src/routes/     workspaces · defects · sessions
-server/src/ws.ts       WebSocket terminal bridge
-web/src/               React 18 + Vite + Tailwind + xterm.js, wouter routing
+shared/types.ts          API contract shared by both sides via the @shared/* path alias
+server/src/core/         config (~/.pat + zod), git, session (pty lifecycle), prompt
+server/src/core/source/  tracker layer — declarative sources, not per-tracker code:
+                         client (HTTP + auth) · expr (field paths) · map (→ Defect)
+                         service (cache) · check (the staged test in Settings)
+server/src/routes/       workspaces · defects · sessions · sources
+server/src/ws.ts         WebSocket terminal bridge
+web/src/components/ui.tsx  the design system — every button, tag, modal and state lives here
+web/src/                 React 18 + Vite + Tailwind + xterm.js, wouter routing
 ```
 
 Stack: Hono, node-pty, ws, zod on the server. React, Vite, Tailwind, wouter, zustand,
-@xterm/xterm on the web. No database, no auth, no Docker, no Next.js — all deliberate.
+@xterm/xterm, lucide-react and @radix-ui/react-popover on the web. No database, no auth,
+no Docker, no Next.js — all deliberate.
 
 ---
 
 ## Configuration
 
-Config lives in `~/.pat/` and is meant to be edited by hand:
+Config lives in `~/.pat/` and is meant to be edited by hand.
 
-| File | Contents |
-|---|---|
-| `workspaces.json` | registered repos |
-| `sessions.json` | session history (latest 50) |
-| `settings.json` | active workspace, port |
+`~` is **your home directory**, not the filesystem root — so `~/.pat` means
+`/home/<you>/.pat` on Linux and WSL, or `/Users/<you>/.pat` on macOS. There is no `/.pat`.
+It is also a **hidden** folder, since the name starts with a dot, so plain `ls` will not show
+it. To find it:
+
+```bash
+ls -a ~/.pat            # what's in there
+cat ~/.pat/sources.json # the file you'll edit most
+echo ~/.pat             # prints the absolute path on your machine
+```
+
+The folder does not exist until fakti creates it. `secrets.json` is written when the server
+starts; `sources.json` is written the first time you open the web UI, copied from
+`server/src/sources.default.json`. So if you started the server but never opened the browser,
+`sources.json` isn't there yet.
+
+| File | Contents | Safe to share |
+|---|---|---|
+| `workspaces.json` | registered repos, and each repo's source variables | no — machine-specific paths |
+| `sessions.json` | session history (latest 50) | no |
+| `settings.json` | active workspace, port | no |
+| `sources.json` | how to reach your defect tracker | yes — holds no secrets |
+| `secrets.json` | the tokens `sources.json` refers to, created `600` | **never** |
 
 Every file is validated with zod on read. If one fails to parse, fakti backs it up to `.bak`,
 starts from empty, and shows a warning in the web UI. It never crashes on bad config.
 Writes are atomic (write to `.tmp`, then rename).
+
+### Connecting a tracker
+
+A tracker is described, not coded. A **source** is one JSON object saying where the API lives,
+which request lists defects, and which field of the response maps to which field fakti shows.
+No plugin, no subclass.
+
+On first run fakti writes `~/.pat/sources.json` from `server/src/sources.default.json`, which
+ships two sources: `mock` (the offline sample, active by default) and `netka`, a worked example
+against a real tracker. Copy either one and edit it:
+
+```jsonc
+{
+  "id": "jira",                                  // unique
+  "label": "Team Jira",                          // shown in Settings
+  "network": "internal",                         // internal = behind VPN, so unreachable is normal, not an error
+  "baseUrl": "https://{host}/rest/api/2",        // {vars} work here too
+  "auth": { "type": "bearer", "tokenRef": "jiraToken" },
+
+  "vars": [                                      // filled in per repo, under Settings
+    { "key": "host", "label": "Jira host", "required": true },
+    { "key": "projectKey", "label": "Project key", "required": true }
+  ],
+
+  "list": {
+    "method": "GET",
+    "path": "/search",
+    "query": { "jql": "project={projectKey} AND resolution=Unresolved" }
+  },
+  "detail": { "method": "GET", "path": "/issue/{id}" },
+
+  "itemsPath": "issues",                         // path to the array; "" if the body is already one
+
+  "map": {                                       // left: what fakti calls it. right: path in the API's JSON
+    "id": "id",
+    "key": "key",
+    "title": "fields.summary",
+    "severity": "fields.priority.name",
+    "status": "fields.status.name",
+    "reporter": "fields.reporter.displayName",
+    "createdAt": "fields.created"
+  },
+
+  "openStatuses": ["To Do", "In Progress"],      // anything else counts as closed
+  "severityOrder": ["Blocker", "Major", "Minor"] // heaviest first, then mapped onto critical/high/medium/low
+}
+```
+
+Only `id`, `label`, `baseUrl`, `list` and `map.id` are required.
+
+**Tokens never go in `sources.json`.** `auth` stores the *name* of a secret, and the value lives
+in `~/.pat/secrets.json` — which is why `sources.json` is the one config file you can commit.
+
+```jsonc
+// ~/.pat/sources.json — shareable
+"auth": { "type": "bearer", "tokenRef": "jiraToken" }
+
+// ~/.pat/secrets.json — mode 600, never shared
+{ "jiraToken": "the-real-value" }
+```
+
+Supported `auth.type`: `none`, `bearer` (`tokenRef`), `header` (`name` + `valueRef`),
+`basic` (`userRef` + `passRef`), `query` (`name` + `valueRef`).
+
+`sources.json` is re-read on every request, so edits take effect on the next page refresh — no
+restart. Settings has a **test** button that walks the request one stage at a time and says which
+stage broke: unreachable, TLS, auth, bad `itemsPath`, or a `map` field that matched nothing. When
+a field misses it prints the keys the response actually had, which is the fastest way to get
+`map` right.
+
+**Sharing a source with your team:** add it to `server/src/sources.default.json` and commit —
+it carries no secrets. Two caveats: that file is only consulted when `~/.pat/sources.json` does
+not yet exist, so people who already ran fakti must add the entry to their own copy; and it is
+bundled at build time, so re-run `pnpm -C server build` after editing.
 
 ---
 
@@ -199,10 +301,10 @@ when fakti did. Returning to the base branch uses `workspace.baseBranch` rather 
 A burst of work shorter than 5 seconds would otherwise never update the UI, and the moment work
 stops is exactly when the diff is final.
 
-**The header pill counts every session that isn't closed,** not only `working`/`waiting`.
-Sessions go `idle` after 2 seconds of silence while still being fully alive, so the literal rule
-made the pill vanish moments after you minimised a session — which is the problem it exists to
-prevent.
+**The sidebar's session count includes every session that isn't closed,** not only
+`working`/`waiting`. Sessions go `idle` after 2 seconds of silence while still being fully
+alive, so the literal rule made the count vanish moments after you minimised a session — which
+is the problem it exists to prevent.
 
 **Monospace font stacks include a Thai face.** JetBrains Mono has no Thai glyphs, so Thai text
 rendered as empty boxes in both the UI and the terminal until `IBM Plex Sans Thai` was appended
@@ -226,8 +328,13 @@ Verified end to end in a real browser (Chromium via Playwright) against a real g
 - discard deleting only fakti-created branches and leaving the user's own branch intact
 - dirty-tree 409, branch-name validation, corrupt-config recovery
 - graceful shutdown killing the pty with no orphan processes
-- 36 navigation assertions: breadcrumbs, back links, Esc behaviour, browser back from every
-  page, unknown URLs, sessions surviving page changes
+- 36 navigation assertions: back links, Esc behaviour, browser back from every page, unknown
+  URLs, sessions surviving page changes
+
+That browser suite **predates the design-system work**, so it exercised the earlier top header
+and breadcrumbs rather than today's sidebar. Routing, pty and git behaviour are unchanged and
+still covered; the new shell and components were checked by type-checking, server-side render
+assertions on every primitive, and by hand in both themes — not yet by Playwright.
 
 **Full task execution is not verified against real Claude Code or Codex.** The pty tests used an interactive shim standing in for
 `claude`. Spawning, I/O, resize and reconnect are proven; two TUI assumptions are not:
@@ -250,5 +357,6 @@ title — it never blocks anything.
 
 ## Not implemented yet
 
-Real tracker API integration · guessing the repo from defect keywords · commit, push or opening
-a PR from the web UI · commenting back on tickets · multi-user and auth.
+Adding or editing a source from the web UI — Settings can select and test one, but new sources
+are still written into `sources.json` by hand · guessing the repo from defect keywords ·
+commit, push or opening a PR from the web UI · commenting back on tickets · multi-user and auth.
